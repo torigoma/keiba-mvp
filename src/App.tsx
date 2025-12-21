@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 import { parseAll } from "./parser";
 import { evaluateAll, recommendedSorted } from "./evaluator";
@@ -10,6 +10,13 @@ export default function App() {
   const [input, setInput] = useState("");
   const [analyzed, setAnalyzed] = useState<{ cards: PickCard[]; statsText: string } | null>(null);
   const [showAll, setShowAll] = useState(false);
+  const [debugEnabled, setDebugEnabled] = useState(false);
+
+  useEffect(() => {
+  const params = new URLSearchParams(window.location.search);
+  setDebugEnabled(params.get("debug") === "1");
+}, []);
+
 
   const recommended = useMemo(() => {
     if (!analyzed) return [];
@@ -64,14 +71,17 @@ export default function App() {
 
         {analyzed?.statsText && <div className="stats">{analyzed.statsText}</div>}
 
-        <details className="debug">
-          <summary>Debug（サンプル注入）</summary>
-          <div className="row">
-            <button onClick={() => { setInput(sample1); analyze(sample1); }}>サンプル①</button>
-            <button onClick={() => { setInput(sample2); analyze(sample2); }}>サンプル②</button>
-            <button onClick={() => { setInput(sample3); analyze(sample3); }}>サンプル③</button>
-          </div>
-        </details>
+       {debugEnabled && (
+  <details className="debug">
+    <summary>Debug（サンプル注入）</summary>
+    <div className="row">
+      <button onClick={() => { setInput(sample1); analyze(sample1); }}>サンプル①</button>
+      <button onClick={() => { setInput(sample2); analyze(sample2); }}>サンプル②</button>
+      <button onClick={() => { setInput(sample3); analyze(sample3); }}>サンプル③</button>
+    </div>
+  </details>
+)}
+
       </section>
 
       <section className="card">
