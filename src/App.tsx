@@ -5,18 +5,27 @@ import { evaluateAll, recommendedSorted } from "./evaluator";
 import { sample1, sample2, sample3 } from "./samples";
 import type { PickCard } from "./types";
 
+type Mode = "main" | "update";
 
 export default function App() {
   const [input, setInput] = useState("");
   const [analyzed, setAnalyzed] = useState<{ cards: PickCard[]; statsText: string } | null>(null);
   const [showAll, setShowAll] = useState(false);
+
+  // debug
   const [debugEnabled, setDebugEnabled] = useState(false);
-
   useEffect(() => {
-  const params = new URLSearchParams(window.location.search);
-  setDebugEnabled(params.get("debug") === "1");
-}, []);
+    const params = new URLSearchParams(window.location.search);
+    setDebugEnabled(params.get("debug") === "1");
+  }, []);
 
+  // mode: main / update
+  const [mode, setMode] = useState<Mode>("main");
+
+  // update targets (snapshot so they don't disappear even if downgraded)
+  const [updateTargets, setUpdateTargets] = useState<PickCard[]>([]);
+  // per-card pasted text (keyed)
+  const [updateInputs, setUpdateInputs] = useState<Record<string, string>>({});
 
   const recommended = useMemo(() => {
     if (!analyzed) return [];
@@ -31,6 +40,74 @@ export default function App() {
     const statsText = `検出: 競馬場${stats.detectedTracks} / レース${stats.detectedRaces} / ヘッダー${stats.detectedHeaders} / 馬行${stats.detectedRunnerLines} / 無視${stats.ignoredLines}`;
     setAnalyzed({ cards, statsText });
     setShowAll(false);
+    setMode("main");
+    setUpdateTargets([]);
+    setUpdateInputs({});
+  }
+
+  function enterUpdateMode() {
+    if (!analyzed) return;
+    const targets = recommendedSorted(analyzed.cards);
+    setUpdateTargets(targets);
+    // 初期入力は空にしておく（貼り付け欄として使う）
+    const init: Record<string, string> = {};
+    for (const c of targets) init[getCardKey(c)] = "";
+    setUpdateInputs(init);
+    setMode("update");
+  }
+
+  function exitUpdateMode() {
+    setMode("main");
+  }
+
+  function setUpdateText(card: PickCard, text: string) {
+    const key = getCardKey(card);
+    setUpdateInputs((prev) => ({ ...prev, [key]: text }));
+  }
+
+  function applyUpdate(card: PickCard) {
+    if (!analyzed) return;
+
+    const key = getCardKey(card);
+    const pasted = updateInputs[key] ?? "";
+    if (!pasted.trim()) {
+      alert("貼り付けテキストが空です。");
+      return;
+    }
+
+    const upd = extractOddsFromPastedText(pasted, card.horseName);
+
+    if (!upd.placeRangeRaw || upd.placeLow == null || upd.placeHigh == null) {
+      alert("複勝レンジ（例: 2.2-3.4）が見つかりませんでした。馬名が含まれる行を貼るのがおすすめです。");
+      return;
+    }
+
+    // Update card fields and re-rank
+    const nextRank = rankFromPlaceLow(upd.placeLow);
+
+    const nextCard: PickCard = {
+      ...card,
+      rank: nextRank,
+      placeRangeText: upd.placeRangeRaw.replaceAll("-", "–"),
+      placeLow: upd.placeLow,
+      winOdds: upd.winOdds ?? card.winOdds,
+      // tags: keep existing but update "妙味あり" depending on threshold
+      tags: updateTags(card.tags, card.winPopularity, upd.placeLow),
+    };
+
+    // Update snapshot targets
+    setUpdateTargets((prev) => prev.map((c) => (getCardKey(c) === key ? nextCard : c)));
+
+    // Also update analyzed.cards so main list reflects latest
+    const nextAnalyzedCards = analyzed.cards.map((c) => {
+      // Match by raceNo+trackName+horseName (stable enough)
+      if (getCardKey(c) === key) return nextCard;
+      return c;
+    });
+    setAnalyzed({ ...analyzed, cards: nextAnalyzedCards });
+
+    // clear input to avoid reusing old paste by mistake
+    setUpdateInputs((prev) => ({ ...prev, [key]: "" }));
   }
 
   return (
@@ -40,6 +117,7 @@ export default function App() {
         <p className="sub">出馬表をまとめて貼る → 自動分割 → 推奨1頭 → S/Aだけ表示</p>
       </header>
 
+      {/* Paste & Analyze */}
       <section className="card">
         <h2>出馬表を貼り付け（全Rまとめ）</h2>
         <textarea
@@ -54,61 +132,150 @@ export default function App() {
                 const t = await navigator.clipboard.readText();
                 setInput(t);
               } catch {
-                // iPhone Safari等は失敗することがあるので、手貼りでOK
                 alert("クリップボード読み取りに失敗しました。手動で貼り付けてください。");
               }
             }}
           >
             貼り付け
           </button>
+
           <button className="primary" disabled={!input.trim()} onClick={() => analyze(input)}>
             解析する
           </button>
-          <button onClick={() => { setInput(""); setAnalyzed(null); }}>
+
+          <button
+            onClick={() => {
+              setInput("");
+              setAnalyzed(null);
+              setMode("main");
+              setUpdateTargets([]);
+              setUpdateInputs({});
+            }}
+          >
             クリア
           </button>
+
+          {analyzed && recommended.length > 0 && mode === "main" && (
+            <button className="primary" onClick={enterUpdateMode}>
+              候補だけ更新（直前用）
+            </button>
+          )}
+
+          {mode === "update" && (
+            <button onClick={exitUpdateMode}>
+              ← 戻る
+            </button>
+          )}
         </div>
 
         {analyzed?.statsText && <div className="stats">{analyzed.statsText}</div>}
 
-       {debugEnabled && (
-  <details className="debug">
-    <summary>Debug（サンプル注入）</summary>
-    <div className="row">
-      <button onClick={() => { setInput(sample1); analyze(sample1); }}>サンプル①</button>
-      <button onClick={() => { setInput(sample2); analyze(sample2); }}>サンプル②</button>
-      <button onClick={() => { setInput(sample3); analyze(sample3); }}>サンプル③</button>
-    </div>
-  </details>
-)}
-
+        {debugEnabled && (
+          <details className="debug">
+            <summary>Debug（サンプル注入）</summary>
+            <div className="row">
+              <button onClick={() => { setInput(sample1); analyze(sample1); }}>サンプル①</button>
+              <button onClick={() => { setInput(sample2); analyze(sample2); }}>サンプル②</button>
+              <button onClick={() => { setInput(sample3); analyze(sample3); }}>サンプル③</button>
+            </div>
+          </details>
+        )}
       </section>
 
-      <section className="card">
-        <h2>おすすめ（S/A）</h2>
+      {/* Main: Recommended list */}
+      {mode === "main" && (
+        <section className="card">
+          <h2>おすすめ（S/A）</h2>
 
-        {analyzed && recommended.length === 0 && (
-          <div className="empty">
-            <div className="title">おすすめが作れませんでした</div>
-            <div className="muted">レース見出し（例：中山 7R / 7R）が貼り付けテキストに含まれているか確認してください。</div>
+          {analyzed && recommended.length === 0 && (
+            <div className="empty">
+              <div className="title">おすすめが作れませんでした</div>
+              <div className="muted">
+                レース見出し（例：中山 7R / 7R）が貼り付けテキストに含まれているか確認してください。
+              </div>
+            </div>
+          )}
+
+          {!analyzed && <div className="muted">まず貼り付けて「解析する」を押してね。</div>}
+
+          {recommended.length > 0 && (
+            <>
+              {(showAll ? recommended : top3).map((c) => (
+                <Pick key={getCardKey(c)} card={c} />
+              ))}
+              {!showAll && recommended.length > 3 && (
+                <button className="link" onClick={() => setShowAll(true)}>
+                  もっと見る（{recommended.length}件）
+                </button>
+              )}
+            </>
+          )}
+        </section>
+      )}
+
+      {/* Update mode: update only targets */}
+      {mode === "update" && (
+        <section className="card">
+          <h2>候補だけ更新（直前）</h2>
+          <div className="muted" style={{ marginBottom: 10 }}>
+            S/A候補だけ並べます。各カードに「そのレースのオッズ表」を貼って更新してください（馬名が含まれる行が理想）。
           </div>
-        )}
 
-        {!analyzed && <div className="muted">まず貼り付けて「解析する」を押してね。</div>}
+          {updateTargets.length === 0 ? (
+            <div className="muted">候補がありません。先に「解析する」を実行してください。</div>
+          ) : (
+            <div style={{ display: "grid", gap: 10 }}>
+              {updateTargets.map((c) => {
+                const key = getCardKey(c);
+                return (
+                  <div key={key} className="pick" style={{ gridTemplateColumns: "44px 1fr" }}>
+                    <div className={`badge badge-${c.rank}`}>{c.rank}</div>
+                    <div className="pick-body">
+                      <div className="pick-head">
+                        <div className="race">{`${c.trackName ?? "不明"} ${c.raceNo}R`}</div>
+                        <div className="muted">現在：複勝 {c.placeRangeText}</div>
+                      </div>
 
-        {recommended.length > 0 && (
-          <>
-            {(showAll ? recommended : top3).map((c) => (
-              <Pick key={`${c.trackName ?? "不明"}-${c.raceNo}-${c.rank}-${c.horseName}`} card={c} />
-            ))}
-            {!showAll && recommended.length > 3 && (
-              <button className="link" onClick={() => setShowAll(true)}>
-                もっと見る（{recommended.length}件）
-              </button>
-            )}
-          </>
-        )}
-      </section>
+                      <div className="main">
+                        ◎ {c.horseName}{c.jockeyName ? `（${c.jockeyName}）` : ""}
+                      </div>
+
+                      <div className="tags">
+                        {c.tags.map((t) => (
+                          <span className="tag" key={t}>{t}</span>
+                        ))}
+                      </div>
+
+                      <textarea
+                        value={updateInputs[key] ?? ""}
+                        onChange={(e) => setUpdateText(c, e.target.value)}
+                        placeholder="このレースのオッズ表（テキスト）を貼り付け"
+                        style={{ width: "100%", minHeight: 120, marginTop: 10 }}
+                      />
+
+                      <div className="row">
+                        <button className="primary" onClick={() => applyUpdate(c)}>
+                          更新
+                        </button>
+                        <button onClick={() => setUpdateText(c, "")}>欄をクリア</button>
+
+                        {/* Sのときは単勝🔥も表示（あれば） */}
+                        {c.rank === "S" && c.winOdds != null && (
+                          <span className="muted">単勝🔥 {c.winOdds.toFixed(1)}</span>
+                        )}
+                      </div>
+
+                      <div className="muted" style={{ marginTop: 6 }}>
+                        更新後の判定：複勝下限 ≥ 3.0 でS、≥ 2.2でA、それ未満でB（候補落ち）
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+      )}
     </div>
   );
 }
@@ -147,4 +314,91 @@ function Pick({ card }: { card: PickCard }) {
       </div>
     </div>
   );
+}
+
+function getCardKey(c: PickCard): string {
+  return `${c.trackName ?? "不明"}_${c.raceNo}_${c.horseName}`;
+}
+
+function rankFromPlaceLow(placeLow: number): "S" | "A" | "B" {
+  if (placeLow >= 3.0) return "S";
+  if (placeLow >= 2.2) return "A";
+  return "B";
+}
+
+function updateTags(prevTags: string[], winPopularity: number | undefined, placeLow: number): string[] {
+  // Keep "中穴(x人気)" and "相手弱め" if present, update "妙味あり" based on placeLow>=2.2
+  const tags = [...prevTags];
+
+  // ensure 中穴タグ
+  const mid = winPopularity != null ? `中穴(${winPopularity}人気)` : "中穴(4–8人気)";
+  const hasMid = tags.some((t) => t.startsWith("中穴("));
+  if (!hasMid) tags.unshift(mid);
+  else {
+    // replace existing mid tag to keep consistency
+    for (let i = 0; i < tags.length; i++) {
+      if (tags[i].startsWith("中穴(")) tags[i] = mid;
+    }
+  }
+
+  const hasValue = tags.includes("妙味あり");
+  if (placeLow >= 2.2) {
+    if (!hasValue) tags.push("妙味あり");
+  } else {
+    // remove if now below threshold
+    const idx = tags.indexOf("妙味あり");
+    if (idx >= 0) tags.splice(idx, 1);
+  }
+
+  // cap to 3 (priority: 中穴, 妙味あり, 相手弱め)
+  const ordered: string[] = [];
+  const pickIf = (name: string) => {
+    const found = tags.find((t) => t === name);
+    if (found) ordered.push(found);
+  };
+  // 中穴
+  const midTag = tags.find((t) => t.startsWith("中穴("));
+  if (midTag) ordered.push(midTag);
+  // 妙味
+  pickIf("妙味あり");
+  // 相手弱め
+  pickIf("相手弱め");
+
+  return ordered.slice(0, 3);
+}
+
+function extractOddsFromPastedText(text: string, horseName: string): {
+  placeLow?: number;
+  placeHigh?: number;
+  placeRangeRaw?: string;
+  winOdds?: number;
+} {
+  const normalized = text
+    .replaceAll("〜", "-")
+    .replaceAll("–", "-")
+    .replaceAll("―", "-")
+    .replaceAll("—", "-")
+    .replaceAll("　", " ");
+
+  const lines = normalized.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+  // Prefer line containing horseName
+  const targetLine = lines.find((l) => l.includes(horseName)) ?? normalized;
+
+  // place range
+  const m = targetLine.match(/(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)/);
+  let placeLow: number | undefined;
+  let placeHigh: number | undefined;
+  let placeRangeRaw: string | undefined;
+  if (m) {
+    placeLow = Number(m[1]);
+    placeHigh = Number(m[2]);
+    placeRangeRaw = `${m[1]}-${m[2]}`;
+  }
+
+  // win odds (optional)
+  const wo = targetLine.match(/(?:単|単勝)\s*[:：]?\s*(\d+(?:\.\d+)?)/);
+  const winOdds = wo ? Number(wo[1]) : undefined;
+
+  return { placeLow, placeHigh, placeRangeRaw, winOdds };
 }
