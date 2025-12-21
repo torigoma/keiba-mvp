@@ -1,6 +1,6 @@
 import type { RaceBlock, RunnerParsed } from "./types";
 
-const TRACKS = ["札幌","函館","福島","新潟","東京","中山","中京","京都","阪神","小倉"];
+const TRACKS = ["札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉"];
 
 export type ParseStats = {
   detectedTracks: number;
@@ -11,7 +11,10 @@ export type ParseStats = {
 };
 
 export function normalize(s: string): string {
-  return s
+  // 全角英数字などを半角に寄せる（７Ｒ→7R / 全角スペースなど）
+  const nfkc = s.normalize("NFKC");
+
+  return nfkc
     .replaceAll("〜", "-")
     .replaceAll("–", "-")
     .replaceAll("―", "-")
@@ -20,19 +23,25 @@ export function normalize(s: string): string {
 }
 
 function detectHeader(line: string): { trackName?: string; raceNo: number } | null {
-  // 競馬場 + R
-  const m1 = line.match(/(札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉)\s*([1-9]|1[0-2])R/);
+  // 競馬場 + レース番号（R / レース / 競走 に対応、"第7競走"も対応）
+  // 例: "中山 7R", "中山 第7競走", "中山 7レース"
+  const m1 = line.match(
+    /(札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉)\s*(?:第\s*)?([1-9]|1[0-2])\s*(R|レース|競走)/
+  );
   if (m1) {
     const track = m1[1];
     const raceNo = Number(m1[2]);
     if (TRACKS.includes(track) && raceNo >= 1 && raceNo <= 12) return { trackName: track, raceNo };
   }
-  // Rのみ
-  const m2 = line.match(/\b([1-9]|1[0-2])R\b/);
+
+  // レース番号のみ（R / レース / 競走）
+  // 例: "7R", "第7競走", "7レース"
+  const m2 = line.match(/(?:第\s*)?([1-9]|1[0-2])\s*(R|レース|競走)/);
   if (m2) {
     const raceNo = Number(m2[1]);
     if (raceNo >= 1 && raceNo <= 12) return { raceNo };
   }
+
   return null;
 }
 
@@ -44,14 +53,22 @@ function isLikelyJockeyName(token: string): boolean {
 }
 
 function parseRunnerLine(line: string): RunnerParsed | null {
-  // 人気（必須）
-  const popM = line.match(/(\d{1,2})\s*人気/);
+  // 人気（必須）: "6人気", "6番人気" どちらもOK
+  const popM = line.match(/(\d{1,2})\s*(?:番)?人気/);
   if (!popM) return null;
   const winPopularity = Number(popM[1]);
 
   // 複勝レンジ（必須）
-  const rangeM = line.match(/(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)/);
+  // まず "複勝 2.2-3.4" を優先
+  let rangeM =
+    line.match(/(?:複|複勝)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)/) ||
+    // フォールバック： "複勝 2.2 3.4"（スペース区切り）
+    line.match(/(?:複|複勝)\s*[:：]?\s*(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)/) ||
+    // 最後の手段：行内にある最初の "2.2-3.4"（複勝が省略されるサイト用）
+    line.match(/(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)/);
+
   if (!rangeM) return null;
+
   const placeLow = Number(rangeM[1]);
   const placeHigh = Number(rangeM[2]);
   const placeRangeRaw = `${rangeM[1]}-${rangeM[2]}`;
@@ -69,9 +86,11 @@ function parseRunnerLine(line: string): RunnerParsed | null {
   if (woM) r.winOdds = Number(woM[1]);
 
   // 馬名/騎手（簡易推定）
+  // 「人気」の左側を使って、末尾の日本語2〜4文字を騎手、1つ前を馬名
   const idx = line.indexOf(`${winPopularity}人気`);
-  if (idx > 0) {
-    const left = line.slice(0, idx).trim();
+  const idx2 = idx >= 0 ? idx : line.indexOf(`${winPopularity}番人気`);
+  if (idx2 > 0) {
+    const left = line.slice(0, idx2).trim();
     const tokens = left.split(/\s+/).filter(Boolean);
     const last = tokens[tokens.length - 1];
     if (last && isLikelyJockeyName(last)) {
@@ -85,7 +104,10 @@ function parseRunnerLine(line: string): RunnerParsed | null {
 
 export function parseAll(text: string): { blocks: RaceBlock[]; stats: ParseStats } {
   const t = normalize(text);
-  const lines = t.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+  const lines = t
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
 
   const blocks: RaceBlock[] = [];
   let currentTrack: string | undefined = undefined;
@@ -125,10 +147,11 @@ export function parseAll(text: string): { blocks: RaceBlock[]; stats: ParseStats
       stats.ignoredLines += 1;
     }
   }
+
   flush();
 
   stats.detectedRaces = blocks.length;
-  stats.detectedTracks = new Set(blocks.map(b => b.trackName).filter(Boolean) as string[]).size;
+  stats.detectedTracks = new Set(blocks.map((b) => b.trackName).filter(Boolean) as string[]).size;
 
   return { blocks, stats };
 }
