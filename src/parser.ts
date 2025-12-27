@@ -1,6 +1,6 @@
 import type { RaceBlock, RunnerParsed } from "./types";
 
-const TRACKS = ["札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉"];
+const TRACKS = ["札幌","函館","福島","新潟","東京","中山","中京","京都","阪神","小倉"];
 
 export type ParseStats = {
   detectedTracks: number;
@@ -11,7 +11,7 @@ export type ParseStats = {
 };
 
 export function normalize(s: string): string {
-  const nfkc = s.normalize("NFKC");
+  const nfkc = s.normalize("NFKC"); // 全角→半角寄せ
   return nfkc
     .replaceAll("〜", "-")
     .replaceAll("–", "-")
@@ -44,37 +44,64 @@ function isNoiseLine(line: string): boolean {
   if (!t) return true;
   if (t === "--") return true;
   if (t === "編集") return true;
-  // 枠番/馬番行っぽい "1 1" など
+  if (t.includes("勝負服")) return true;
+  if (t.startsWith("父：") || t.startsWith("母：")) return true;
+  if (t.includes("ノーザンファーム") || t.includes("ファーム") || t.includes("牧場")) return true;
+  if (t.includes("栗東") || t.includes("美浦")) return true;
+  if (t.includes("ブリンカー") || t.includes("着用")) return true;
+
+  // 枠番/馬番みたいな "1 1" など
   if (/^\d+\s+\d+$/.test(t)) return true;
+
   return false;
+}
+
+function detectFrameStart(line: string): boolean {
+  // "枠1白 1" みたいなブロック開始
+  return /^枠\d/.test(line.trim());
 }
 
 function looksLikeHorseNameLine(line: string): boolean {
   const t = line.trim();
   if (isNoiseLine(t)) return false;
 
-  // 馬名行は基本：数字が入らない、性齢(牡/牝/セ)も入らない
+  // 数字/斤量/万円/日付っぽいのは除外
   if (/[0-9]/.test(t)) return false;
+  if (t.includes("kg") || t.includes("万円") || t.includes("年")) return false;
+
+  // 性齢（牡/牝/セ）が入ってたら馬名ではない
   if (/[牡牝セ]/.test(t)) return false;
 
-  // 「栗東」「美浦」などは馬名ではない
-  if (t.includes("栗東") || t.includes("美浦")) return false;
-
-  // ほどほどの長さ
-  if (t.length < 2 || t.length > 30) return false;
+  // 長すぎるのは除外
+  if (t.length < 2 || t.length > 25) return false;
 
   return true;
 }
 
+function parseOddsOnlyLine(line: string): number | null {
+  // オッズ行は "30.9" のように小数のみ（:を含むタイム等は除外できる）
+  const t = line.trim();
+  if (/^\d+\.\d+$/.test(t)) return Number(t);
+  return null;
+}
+
+function parsePopularityOnlyLine(line: string): number | null {
+  // "(9番人気)" / "9番人気"
+  const t = line.trim();
+  const m = t.match(/^\(?\s*(\d{1,2})\s*番人気\s*\)?$/);
+  if (!m) return null;
+  return Number(m[1]);
+}
+
 function parseOddsPopAtLineEnd(line: string): { winOdds: number; winPopularity: number; jockeyName?: string } | null {
-  // 末尾が "... 28.8 7" の形を拾う（タブ区切りでもOK）
+  // 末尾が "... 28.8 7" 形式（タブ区切りでもOK）
   const m = line.match(/(\d+(?:\.\d+)?)\s+(\d{1,2})\s*$/);
   if (!m) return null;
 
   const winOdds = Number(m[1]);
   const winPopularity = Number(m[2]);
 
-  // おまけ：斤量(45-65くらい)の次のトークンを騎手として推定
+  // 斤量(45-65くらい)の次トークンを騎手っぽく拾う（おまけ）
   const parts = line.split(/\s+/).filter(Boolean);
   let jockeyName: string | undefined = undefined;
   for (let i = 0; i < parts.length - 1; i++) {
@@ -88,17 +115,18 @@ function parseOddsPopAtLineEnd(line: string): { winOdds: number; winPopularity: 
   return { winOdds, winPopularity, jockeyName };
 }
 
-function isLikelyJockeyName(token: string): boolean {
-  const len = token.length;
-  if (len < 2 || len > 6) return false; // Cデムーロ等を拾えるように少し緩める
-  if (/\d/.test(token)) return false;
-  return true;
-}
-
 function parseRunnerLineSingle(line: string): RunnerParsed | null {
-  // 既存形式：人気 + 複勝レンジ
-  const popM = line.match(/(\d{1,2})\s*(?:番)?人気/);
+  // ① 馬名 オッズ (n番人気)
+  const m = line.match(/^(.+?)\s+(\d+(?:\.\d+)?)\s*\(\s*(\d{1,2})\s*番人気\s*\)/);
+  if (m) {
+    const horseName = m[1].trim();
+    const winOdds = Number(m[2]);
+    const winPopularity = Number(m[3]);
+    return { rawLine: line, horseName, winOdds, winPopularity };
+  }
 
+  // ② 人気 + 複勝レンジ（以前の形式）
+  const popM = line.match(/(\d{1,2})\s*(?:番)?人気/);
   let rangeM =
     line.match(/(?:複|複勝)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)/) ||
     line.match(/(?:複|複勝)\s*[:：]?\s*(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)/) ||
@@ -110,38 +138,12 @@ function parseRunnerLineSingle(line: string): RunnerParsed | null {
     const placeHigh = Number(rangeM[2]);
     const placeRangeRaw = `${rangeM[1]}-${rangeM[2]}`;
 
-    const r: RunnerParsed = {
-      rawLine: line,
-      winPopularity,
-      placeLow,
-      placeHigh,
-      placeRangeRaw,
-    };
+    const r: RunnerParsed = { rawLine: line, winPopularity, placeLow, placeHigh, placeRangeRaw };
 
     const woM = line.match(/(?:単|単勝)\s*[:：]?\s*(\d+(?:\.\d+)?)/);
     if (woM) r.winOdds = Number(woM[1]);
 
-    const idx = line.indexOf(`${winPopularity}人気`);
-    const idx2 = idx >= 0 ? idx : line.indexOf(`${winPopularity}番人気`);
-    if (idx2 > 0) {
-      const left = line.slice(0, idx2).trim();
-      const tokens = left.split(/\s+/).filter(Boolean);
-      const last = tokens[tokens.length - 1];
-      if (last && isLikelyJockeyName(last)) {
-        r.jockeyName = last;
-        if (tokens.length >= 2) r.horseName = tokens[tokens.length - 2];
-      }
-    }
     return r;
-  }
-
-  // 既存形式：馬名 オッズ (n番人気)
-  const m = line.match(/^(.+?)\s+(\d+(?:\.\d+)?)\s*\(\s*(\d{1,2})\s*番人気\s*\)/);
-  if (m) {
-    const horseName = m[1].trim();
-    const winOdds = Number(m[2]);
-    const winPopularity = Number(m[3]);
-    return { rawLine: line, horseName, winOdds, winPopularity };
   }
 
   return null;
@@ -149,16 +151,21 @@ function parseRunnerLineSingle(line: string): RunnerParsed | null {
 
 export function parseAll(text: string): { blocks: RaceBlock[]; stats: ParseStats } {
   const t = normalize(text);
-  const lines = t
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
+  const lines = t.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
 
   const blocks: RaceBlock[] = [];
   let currentTrack: string | undefined = undefined;
   let currentRaceNo: number | null = null;
   let currentRunners: RunnerParsed[] = [];
-  let pendingHorseName: string | null = null; // ★今回追加：馬名行を覚える
+
+  // 旧「馬名→次行で末尾に odds pop」形式用
+  let pendingHorseName: string | null = null;
+
+  // ★新「枠…→馬名→オッズ→(人気)」形式用
+  let cardActive = false;
+  let cardHorseName: string | null = null;
+  let cardWinOdds: number | null = null;
+  let cardWinPop: number | null = null;
 
   const stats: ParseStats = {
     detectedTracks: 0,
@@ -174,10 +181,19 @@ export function parseAll(text: string): { blocks: RaceBlock[]; stats: ParseStats
     }
     currentRunners = [];
     pendingHorseName = null;
+    cardActive = false;
+    cardHorseName = null;
+    cardWinOdds = null;
+    cardWinPop = null;
+  };
+
+  const pushRunner = (r: RunnerParsed) => {
+    if (currentRaceNo == null) currentRaceNo = 1; // ヘッダー無しは不明1R扱い
+    currentRunners.push(r);
+    stats.detectedRunnerLines += 1;
   };
 
   for (const line of lines) {
-    // header
     const header = detectHeader(line);
     if (header) {
       flush();
@@ -187,43 +203,84 @@ export function parseAll(text: string): { blocks: RaceBlock[]; stats: ParseStats
       continue;
     }
 
-    if (isNoiseLine(line)) {
-      continue;
-    }
-
-    // single-line parse
-    const single = parseRunnerLineSingle(line);
-    if (single) {
-      if (currentRaceNo == null) currentRaceNo = 1; // ヘッダー無しでも1レース扱い
-      currentRunners.push(single);
-      stats.detectedRunnerLines += 1;
+    // 新形式：枠ブロック開始
+    if (detectFrameStart(line)) {
+      cardActive = true;
+      cardHorseName = null;
+      cardWinOdds = null;
+      cardWinPop = null;
       pendingHorseName = null;
       continue;
     }
 
-    // horse name line
-    if (looksLikeHorseNameLine(line)) {
-      pendingHorseName = line.trim();
+    if (isNoiseLine(line)) continue;
+
+    // ★枠ブロック中なら、馬名→オッズ→人気 を拾う
+    if (cardActive) {
+      if (!cardHorseName && looksLikeHorseNameLine(line)) {
+        cardHorseName = line.trim();
+        continue;
+      }
+
+      if (cardWinOdds == null) {
+        const o = parseOddsOnlyLine(line);
+        if (o != null) {
+          cardWinOdds = o;
+          // まだ人気が来るまで待つ
+          continue;
+        }
+      }
+
+      if (cardWinPop == null) {
+        const p = parsePopularityOnlyLine(line);
+        if (p != null) {
+          cardWinPop = p;
+          // ここで揃ったら確定
+        }
+      }
+
+      if (cardHorseName && cardWinOdds != null && cardWinPop != null) {
+        pushRunner({
+          rawLine: `${cardHorseName} / odds:${cardWinOdds} pop:${cardWinPop}`,
+          horseName: cardHorseName,
+          winOdds: cardWinOdds,
+          winPopularity: cardWinPop,
+        });
+        cardActive = false; // 次の枠まで無視（過去成績の人気行に釣られない）
+        cardHorseName = null;
+        cardWinOdds = null;
+        cardWinPop = null;
+      }
       continue;
     }
 
-    // table detail line: use pendingHorseName + "... odds pop"
+    // 1行で完結する形式
+    const single = parseRunnerLineSingle(line);
+    if (single) {
+      pushRunner(single);
+      pendingHorseName = null;
+      continue;
+    }
+
+    // 旧形式：馬名行→次の行の末尾に "odds pop"
     if (pendingHorseName) {
       const op = parseOddsPopAtLineEnd(line);
       if (op) {
-        if (currentRaceNo == null) currentRaceNo = 1;
-        const r: RunnerParsed = {
+        pushRunner({
           rawLine: `${pendingHorseName} / ${line}`,
           horseName: pendingHorseName,
           jockeyName: op.jockeyName,
           winOdds: op.winOdds,
           winPopularity: op.winPopularity,
-        };
-        currentRunners.push(r);
-        stats.detectedRunnerLines += 1;
+        });
         pendingHorseName = null;
         continue;
       }
+    }
+
+    if (looksLikeHorseNameLine(line)) {
+      pendingHorseName = line.trim();
+      continue;
     }
 
     stats.ignoredLines += 1;
