@@ -34,6 +34,14 @@ export default function App() {
 
   const top3 = recommended.slice(0, 3);
 
+  // ★追加：内訳（S/A/B/Cの件数）
+  const rankCounts = useMemo(() => {
+    const c: Record<"S" | "A" | "B" | "C", number> = { S: 0, A: 0, B: 0, C: 0 };
+    if (!analyzed) return c;
+    for (const x of analyzed.cards) c[x.rank] += 1;
+    return c;
+  }, [analyzed]);
+
   function analyze(text: string) {
     const { blocks, stats } = parseAll(text);
     const cards = evaluateAll(blocks);
@@ -49,10 +57,11 @@ export default function App() {
     if (!analyzed) return;
     const targets = recommendedSorted(analyzed.cards);
     setUpdateTargets(targets);
-    // 初期入力は空にしておく（貼り付け欄として使う）
+
     const init: Record<string, string> = {};
     for (const c of targets) init[getCardKey(c)] = "";
     setUpdateInputs(init);
+
     setMode("update");
   }
 
@@ -77,12 +86,11 @@ export default function App() {
 
     const upd = extractOddsFromPastedText(pasted, card.horseName);
 
-    if (!upd.placeRangeRaw || upd.placeLow == null || upd.placeHigh == null) {
+    if (upd.placeRangeRaw == null || upd.placeLow == null || upd.placeHigh == null) {
       alert("複勝レンジ（例: 2.2-3.4）が見つかりませんでした。馬名が含まれる行を貼るのがおすすめです。");
       return;
     }
 
-    // Update card fields and re-rank
     const nextRank = rankFromPlaceLow(upd.placeLow);
 
     const nextCard: PickCard = {
@@ -91,22 +99,17 @@ export default function App() {
       placeRangeText: upd.placeRangeRaw.replaceAll("-", "–"),
       placeLow: upd.placeLow,
       winOdds: upd.winOdds ?? card.winOdds,
-      // tags: keep existing but update "妙味あり" depending on threshold
       tags: updateTags(card.tags, card.winPopularity, upd.placeLow),
     };
 
-    // Update snapshot targets
     setUpdateTargets((prev) => prev.map((c) => (getCardKey(c) === key ? nextCard : c)));
 
-    // Also update analyzed.cards so main list reflects latest
     const nextAnalyzedCards = analyzed.cards.map((c) => {
-      // Match by raceNo+trackName+horseName (stable enough)
       if (getCardKey(c) === key) return nextCard;
       return c;
     });
     setAnalyzed({ ...analyzed, cards: nextAnalyzedCards });
 
-    // clear input to avoid reusing old paste by mistake
     setUpdateInputs((prev) => ({ ...prev, [key]: "" }));
   }
 
@@ -161,11 +164,7 @@ export default function App() {
             </button>
           )}
 
-          {mode === "update" && (
-            <button onClick={exitUpdateMode}>
-              ← 戻る
-            </button>
-          )}
+          {mode === "update" && <button onClick={exitUpdateMode}>← 戻る</button>}
         </div>
 
         {analyzed?.statsText && <div className="stats">{analyzed.statsText}</div>}
@@ -187,13 +186,22 @@ export default function App() {
         <section className="card">
           <h2>おすすめ（S/A）</h2>
 
+          {/* ★ここが変更点：解析失敗 と 見送り を分ける */}
           {analyzed && recommended.length === 0 && (
-            <div className="empty">
-              <div className="title">おすすめが作れませんでした</div>
-              <div className="muted">
-                レース見出し（例：中山 7R / 7R）が貼り付けテキストに含まれているか確認してください。
+            analyzed.cards.length === 0 ? (
+              <div className="empty">
+                <div className="title">解析できませんでした</div>
+                <div className="muted">
+                  レース見出し（例：中山 7R / 7R）や、人気・オッズなどが貼り付けテキストに含まれているか確認してください。
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="empty">
+                <div className="title">S/A候補なし（今日は見送り）</div>
+                <div className="muted">解析はできています。条件に合う候補が無かっただけです。</div>
+                <div className="muted">内訳：S {rankCounts.S} / A {rankCounts.A} / B {rankCounts.B} / C {rankCounts.C}</div>
+              </div>
+            )
           )}
 
           {!analyzed && <div className="muted">まず貼り付けて「解析する」を押してね。</div>}
@@ -259,7 +267,6 @@ export default function App() {
                         </button>
                         <button onClick={() => setUpdateText(c, "")}>欄をクリア</button>
 
-                        {/* Sのときは単勝🔥も表示（あれば） */}
                         {c.rank === "S" && c.winOdds != null && (
                           <span className="muted">単勝🔥 {c.winOdds.toFixed(1)}</span>
                         )}
@@ -327,15 +334,12 @@ function rankFromPlaceLow(placeLow: number): "S" | "A" | "B" {
 }
 
 function updateTags(prevTags: string[], winPopularity: number | undefined, placeLow: number): string[] {
-  // Keep "中穴(x人気)" and "相手弱め" if present, update "妙味あり" based on placeLow>=2.2
   const tags = [...prevTags];
 
-  // ensure 中穴タグ
   const mid = winPopularity != null ? `中穴(${winPopularity}人気)` : "中穴(4–8人気)";
   const hasMid = tags.some((t) => t.startsWith("中穴("));
   if (!hasMid) tags.unshift(mid);
   else {
-    // replace existing mid tag to keep consistency
     for (let i = 0; i < tags.length; i++) {
       if (tags[i].startsWith("中穴(")) tags[i] = mid;
     }
@@ -345,24 +349,15 @@ function updateTags(prevTags: string[], winPopularity: number | undefined, place
   if (placeLow >= 2.2) {
     if (!hasValue) tags.push("妙味あり");
   } else {
-    // remove if now below threshold
     const idx = tags.indexOf("妙味あり");
     if (idx >= 0) tags.splice(idx, 1);
   }
 
-  // cap to 3 (priority: 中穴, 妙味あり, 相手弱め)
   const ordered: string[] = [];
-  const pickIf = (name: string) => {
-    const found = tags.find((t) => t === name);
-    if (found) ordered.push(found);
-  };
-  // 中穴
   const midTag = tags.find((t) => t.startsWith("中穴("));
   if (midTag) ordered.push(midTag);
-  // 妙味
-  pickIf("妙味あり");
-  // 相手弱め
-  pickIf("相手弱め");
+  if (tags.includes("妙味あり")) ordered.push("妙味あり");
+  if (tags.includes("相手弱め")) ordered.push("相手弱め");
 
   return ordered.slice(0, 3);
 }
@@ -381,11 +376,8 @@ function extractOddsFromPastedText(text: string, horseName: string): {
     .replaceAll("　", " ");
 
   const lines = normalized.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-
-  // Prefer line containing horseName
   const targetLine = lines.find((l) => l.includes(horseName)) ?? normalized;
 
-  // place range
   const m = targetLine.match(/(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)/);
   let placeLow: number | undefined;
   let placeHigh: number | undefined;
@@ -396,7 +388,6 @@ function extractOddsFromPastedText(text: string, horseName: string): {
     placeRangeRaw = `${m[1]}-${m[2]}`;
   }
 
-  // win odds (optional)
   const wo = targetLine.match(/(?:単|単勝)\s*[:：]?\s*(\d+(?:\.\d+)?)/);
   const winOdds = wo ? Number(wo[1]) : undefined;
 
